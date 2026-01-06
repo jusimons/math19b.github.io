@@ -3,7 +3,6 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-
   <title>Weekly Availability</title>
 
   <!-- FullCalendar (CDN) -->
@@ -13,66 +12,46 @@
   <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/timegrid@6.1.15/index.global.min.js"></script>
 
   <style>
-    body {
-      margin: 0;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      color: #111;
-    }
-    #wrap {
-      padding: 12px;
-    }
-    #calendar {
-      margin-top: 8px;
-    }
-    .note {
-      font-size: 14px;
-      line-height: 1.4;
-      margin: 0 0 10px 0;
-    }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#111; }
+    #wrap { padding: 12px; }
+    #calendar { margin-top: 8px; }
+    .note { font-size: 14px; line-height: 1.4; margin: 0 0 10px 0; }
     .error {
-      border: 1px solid #ddd;
-      background: #fafafa;
-      padding: 10px;
-      border-radius: 8px;
-      margin-top: 10px;
-      white-space: pre-wrap;
+      border: 1px solid #ddd; background: #fafafa; padding: 10px; border-radius: 8px;
+      margin-top: 10px; white-space: pre-wrap;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-size: 12px;
-      color: #222;
+      font-size: 12px; color:#222;
     }
   </style>
 </head>
 
 <body>
   <div id="wrap">
-    <p class="note">
-      Weekly availability (auto-updates from Google Sheets). If something looks off, refresh the page.
-    </p>
+    <p class="note">Weekly schedule (auto-updates from Google Sheets). Refresh if something looks stale.</p>
     <div id="calendar"></div>
     <div id="errorBox" class="error" style="display:none;"></div>
   </div>
 
   <script>
     // ======================
-    // CONFIG — EDIT THESE
+    // CONFIG — YOUR SHEET
     // ======================
     const SHEET_ID = "1LkjDR3JC-L5n8zoEQEzJJOoGLvgzfTahEwQcZCbGghc";
-    const SHEET_NAME = "Sheet1";            // change if you rename the tab
-    const RANGE_A1 = `${SHEET_NAME}!A:D`;   // assumes columns A-D are Event Type, Day, Time, Location
-    const API_KEY = "YOUR_API_KEY_HERE";    // use a rotated + restricted key
+    const SHEET_NAME = "Sheet1";
+    const RANGE_A1 = `${SHEET_NAME}!A:D`;
 
-    // If your headers differ, adjust these:
+    // IMPORTANT: use a rotated + restricted key (Sheets API only; referrer restricted to your GitHub Pages domain)
+    const API_KEY = "YOUR_API_KEY_HERE";
+
+    // Exact headers in your sheet:
     const COL_EVENT = "Event Type";
     const COL_DAY = "Day";
     const COL_TIME = "Time";
     const COL_LOCATION = "Location";
 
-    // Day codes expected in sheet:
+    // Sunday-start week
     const DAY_INDEX = { Su: 0, Mo: 1, Tu: 2, We: 3, Th: 4, Fr: 5, Sa: 6 };
 
-    // ======================
-    // HELPERS
-    // ======================
     function showError(msg) {
       const box = document.getElementById("errorBox");
       box.style.display = "block";
@@ -90,14 +69,14 @@
     function normalizeDay(rawDay, eventTypeMaybe) {
       let d = String(rawDay || "").trim();
 
-      // Some sheets accidentally embed the day in the title, e.g. "Office Hours (...)Fr"
-      if (!d && eventTypeMaybe) {
+      // Recover day code if it was accidentally appended to the event type, e.g. "Office Hours (Simons)Fr"
+      if ((!d || d.length < 2) && eventTypeMaybe) {
         const m = String(eventTypeMaybe).match(/\b(Su|Mo|Tu|We|Th|Fr|Sa|Ft|Thu|Tue)\b/);
         if (m) d = m[1];
       }
 
       // Normalize common variants/typos
-      if (d === "Ft") d = "Fr";
+      if (d === "Ft") d = "Fr";   // observed in your sheet
       if (d === "F") d = "Fr";
       if (d === "Thu") d = "Th";
       if (d === "Tue") d = "Tu";
@@ -115,13 +94,11 @@
       const endPart = parts[1].replace(/\s+/g, "");
 
       function parseAmPm(s) {
-        // "1:20PM" or "12:05AM"
         const m = s.match(/^(\d{1,2}):(\d{2})(AM|PM)$/i);
         if (!m) return null;
         let hh = Number(m[1]);
         const mm = Number(m[2]);
         const ap = m[3].toUpperCase();
-
         if (ap === "PM" && hh !== 12) hh += 12;
         if (ap === "AM" && hh === 12) hh = 0;
         return { hh, mm };
@@ -130,7 +107,6 @@
       const sTime = parseAmPm(startPart);
       const eTime = parseAmPm(endPart);
       if (!sTime || !eTime) return null;
-
       return { start: sTime, end: eTime };
     }
 
@@ -139,13 +115,13 @@
         `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(RANGE_A1)}?key=${API_KEY}`;
 
       const res = await fetch(url);
-      const bodyText = await res.text();
+      const text = await res.text();
 
       if (!res.ok) {
-        throw new Error(`Sheets API request failed (${res.status}).\n${bodyText}`);
+        throw new Error(`Sheets API request failed (${res.status}).\n${text}`);
       }
 
-      const data = JSON.parse(bodyText);
+      const data = JSON.parse(text);
       const values = data.values || [];
       if (values.length < 2) return [];
 
@@ -157,7 +133,6 @@
 
     function buildEvents(sheetRows) {
       const weekStart = startOfWeekSunday(new Date());
-
       const events = [];
       const problems = [];
 
@@ -171,29 +146,26 @@
         const dayCode = normalizeDay(dayRaw, title);
 
         if (!DAY_INDEX.hasOwnProperty(dayCode)) {
-          problems.push(`Skipping row (bad/missing Day): title="${title}", Day="${dayRaw}"`);
+          problems.push(`Skipped (bad Day): Event Type="${titleRaw}" Day="${dayRaw}" Time="${timeRaw}"`);
           continue;
         }
 
         const tr = parseTimeRange(timeRaw);
         if (!tr) {
-          problems.push(`Skipping row (bad Time format): title="${title}", Time="${timeRaw}"`);
+          problems.push(`Skipped (bad Time): Event Type="${titleRaw}" Day="${dayRaw}" Time="${timeRaw}"`);
           continue;
         }
 
-        const dayOffset = DAY_INDEX[dayCode];
-
         const start = new Date(weekStart);
-        start.setDate(start.getDate() + dayOffset);
+        start.setDate(start.getDate() + DAY_INDEX[dayCode]);
         start.setHours(tr.start.hh, tr.start.mm, 0, 0);
 
         const end = new Date(weekStart);
-        end.setDate(end.getDate() + dayOffset);
+        end.setDate(end.getDate() + DAY_INDEX[dayCode]);
         end.setHours(tr.end.hh, tr.end.mm, 0, 0);
 
-        // Handle accidental end-before-start (rare, but protects against formatting mistakes)
         if (end <= start) {
-          problems.push(`Skipping row (end <= start): title="${title}", Time="${timeRaw}"`);
+          problems.push(`Skipped (end<=start): Event Type="${titleRaw}" Day="${dayRaw}" Time="${timeRaw}"`);
           continue;
         }
 
@@ -205,7 +177,6 @@
         });
       }
 
-      // If there were parsing problems, surface them in console for debugging without breaking the page
       if (problems.length) {
         console.warn("Some rows were skipped due to formatting issues:\n" + problems.join("\n"));
       }
@@ -214,7 +185,7 @@
     }
 
     async function init() {
-      if (!API_KEY || API_KEY.includes("AIzaSyCLYdL-iAyWAPuSIoqALOZOPTXIitXvUMQ")) {
+      if (!API_KEY || API_KEY.includes("YOUR_API_KEY_HERE")) {
         showError("Configuration error: Please set API_KEY to your (restricted) Google Sheets API key.");
         return;
       }
@@ -225,14 +196,13 @@
       const calendarEl = document.getElementById("calendar");
       const calendar = new FullCalendar.Calendar(calendarEl, {
         initialView: "timeGridWeek",
-        firstDay: 0,            // Sunday
+        firstDay: 0, // Sunday
         allDaySlot: false,
         nowIndicator: true,
         height: "auto",
         slotMinTime: "07:00:00",
         slotMaxTime: "22:00:00",
         events,
-
         eventDidMount: function(info) {
           const loc = info.event.extendedProps.location;
           if (loc) info.el.title = loc;
@@ -247,11 +217,11 @@
       showError(
         "Error loading calendar data.\n\n" +
         (err && err.message ? err.message : String(err)) +
-        "\n\nTroubleshooting:\n" +
-        "1) Confirm the sheet tab name matches SHEET_NAME.\n" +
-        "2) Confirm headers include: Event Type, Day, Time, Location.\n" +
-        "3) Confirm your API key is valid and restricted to your GitHub Pages referrer.\n" +
-        "4) Confirm the Google Sheets API is enabled in your Google Cloud project."
+        "\n\nChecklist:\n" +
+        "• Is the Google Sheets API enabled for this key?\n" +
+        "• Is the key restricted to your GitHub Pages referrer?\n" +
+        "• Is the sheet/tab name 'Sheet1' (it is, per your link)?\n" +
+        "• Do headers match: Event Type, Day, Time, Location?"
       );
     });
   </script>
