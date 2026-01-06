@@ -1,135 +1,238 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
+  <title>Weekly Availability</title>
+
   <!-- FullCalendar (CDN) -->
   <link href="https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/index.global.min.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/@fullcalendar/timegrid@6.1.15/index.global.min.css" rel="stylesheet">
-
   <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/index.global.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/timegrid@6.1.15/index.global.min.js"></script>
 
   <style>
-    body { margin: 0; padding: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
-    #calendar { padding: 12px; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color: #111;
+    }
+    #wrap {
+      padding: 12px;
+    }
+    #calendar {
+      margin-top: 8px;
+    }
+    .note {
+      font-size: 14px;
+      line-height: 1.4;
+      margin: 0 0 10px 0;
+    }
+    .error {
+      border: 1px solid #ddd;
+      background: #fafafa;
+      padding: 10px;
+      border-radius: 8px;
+      margin-top: 10px;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      color: #222;
+    }
   </style>
 </head>
 
 <body>
-  <div id="calendar"></div>
+  <div id="wrap">
+    <p class="note">
+      Weekly availability (auto-updates from Google Sheets). If something looks off, refresh the page.
+    </p>
+    <div id="calendar"></div>
+    <div id="errorBox" class="error" style="display:none;"></div>
+  </div>
 
   <script>
-    // ==== CONFIG ====
+    // ======================
+    // CONFIG — EDIT THESE
+    // ======================
     const SHEET_ID = "1LkjDR3JC-L5n8zoEQEzJJOoGLvgzfTahEwQcZCbGghc";
-    const SHEET_NAME = "Sheet1"; // or "Availability"
-    // gviz endpoint (requires the sheet/tab to be accessible)
-    const GVIZ_URL =
-      `https://docs.google.com/spreadsheets/d/1LkjDR3JC-L5n8zoEQEzJJOoGLvgzfTahEwQcZCbGghc/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(Sheet1)}`;
+    const SHEET_NAME = "Sheet1";            // change if you rename the tab
+    const RANGE_A1 = `${SHEET_NAME}!A:D`;   // assumes columns A-D are Event Type, Day, Time, Location
+    const API_KEY = "YOUR_API_KEY_HERE";    // use a rotated + restricted key
 
-    // Map your day codes to FullCalendar's Sunday-start week indexing
+    // If your headers differ, adjust these:
+    const COL_EVENT = "Event Type";
+    const COL_DAY = "Day";
+    const COL_TIME = "Time";
+    const COL_LOCATION = "Location";
+
+    // Day codes expected in sheet:
     const DAY_INDEX = { Su: 0, Mo: 1, Tu: 2, We: 3, Th: 4, Fr: 5, Sa: 6 };
 
-    function startOfWeek(d) {
-      // Sunday as start of week
+    // ======================
+    // HELPERS
+    // ======================
+    function showError(msg) {
+      const box = document.getElementById("errorBox");
+      box.style.display = "block";
+      box.textContent = msg;
+    }
+
+    function startOfWeekSunday(d) {
       const date = new Date(d);
-      date.setHours(0,0,0,0);
+      date.setHours(0, 0, 0, 0);
       const diff = date.getDay(); // 0=Sun
       date.setDate(date.getDate() - diff);
       return date;
     }
 
-    function parseTime24(t) {
-      // Expect "HH:MM" in 24h format, e.g. "15:30"
-      const [hh, mm] = t.split(":").map(Number);
-      return { hh, mm };
+    function normalizeDay(rawDay, eventTypeMaybe) {
+      let d = String(rawDay || "").trim();
+
+      // Some sheets accidentally embed the day in the title, e.g. "Office Hours (...)Fr"
+      if (!d && eventTypeMaybe) {
+        const m = String(eventTypeMaybe).match(/\b(Su|Mo|Tu|We|Th|Fr|Sa|Ft|Thu|Tue)\b/);
+        if (m) d = m[1];
+      }
+
+      // Normalize common variants/typos
+      if (d === "Ft") d = "Fr";
+      if (d === "F") d = "Fr";
+      if (d === "Thu") d = "Th";
+      if (d === "Tue") d = "Tu";
+
+      return d;
     }
 
-    async function fetchSheetRows() {
-      const res = await fetch(GVIZ_URL);
-      const text = await res.text();
+    function parseTimeRange(timeStr) {
+      // Accepts: "1:20PM - 2:25PM" (spaces optional)
+      const raw = String(timeStr || "").trim();
+      const parts = raw.split("-").map(s => s.trim());
+      if (parts.length !== 2) return null;
 
-      // gviz returns JSON wrapped in a function call; extract the JSON payload
-      const jsonText = text.substring(text.indexOf("{"), text.lastIndexOf("}") + 1);
-      const data = JSON.parse(jsonText);
+      const startPart = parts[0].replace(/\s+/g, "");
+      const endPart = parts[1].replace(/\s+/g, "");
 
-      const cols = data.table.cols.map(c => (c.label || "").trim());
-      const rows = data.table.rows.map(r => r.c.map(cell => (cell ? cell.v : "")));
+      function parseAmPm(s) {
+        // "1:20PM" or "12:05AM"
+        const m = s.match(/^(\d{1,2}):(\d{2})(AM|PM)$/i);
+        if (!m) return null;
+        let hh = Number(m[1]);
+        const mm = Number(m[2]);
+        const ap = m[3].toUpperCase();
 
-      // Turn each row into an object keyed by column header
-      return rows
-        .filter(r => r.some(v => String(v).trim() !== ""))
-        .map(r => Object.fromEntries(cols.map((k, i) => [k, r[i]])));
+        if (ap === "PM" && hh !== 12) hh += 12;
+        if (ap === "AM" && hh === 12) hh = 0;
+        return { hh, mm };
+      }
+
+      const sTime = parseAmPm(startPart);
+      const eTime = parseAmPm(endPart);
+      if (!sTime || !eTime) return null;
+
+      return { start: sTime, end: eTime };
+    }
+
+    async function fetchSheetRowsViaApi() {
+      const url =
+        `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(RANGE_A1)}?key=${API_KEY}`;
+
+      const res = await fetch(url);
+      const bodyText = await res.text();
+
+      if (!res.ok) {
+        throw new Error(`Sheets API request failed (${res.status}).\n${bodyText}`);
+      }
+
+      const data = JSON.parse(bodyText);
+      const values = data.values || [];
+      if (values.length < 2) return [];
+
+      const headers = values[0].map(h => String(h).trim());
+      return values.slice(1)
+        .filter(row => row.some(cell => String(cell || "").trim() !== ""))
+        .map(row => Object.fromEntries(headers.map((h, i) => [h, row[i] ?? ""])));
     }
 
     function buildEvents(sheetRows) {
-      const now = new Date();
-      const weekStart = startOfWeek(now);
+      const weekStart = startOfWeekSunday(new Date());
 
-      return sheetRows.map(row => {
-        // Adjust these field names to match your tab headers:
-        const title = row["Event Type"] || row["Title"] || "Available";
-        const dayCode = row["Day"];
-        const timeStr = row["Time"];
-        const location = row["Location"] || "";
+      const events = [];
+      const problems = [];
 
-        // If you switch to Start/End columns, use those instead:
-        // const { hh: sh, mm: sm } = parseTime24(row["Start"]);
-        // const { hh: eh, mm: em } = parseTime24(row["End"]);
+      for (const row of sheetRows) {
+        const titleRaw = row[COL_EVENT] ?? "";
+        const dayRaw = row[COL_DAY] ?? "";
+        const timeRaw = row[COL_TIME] ?? "";
+        const location = row[COL_LOCATION] ?? "";
 
-        // If you keep a single "Time" like "1:20PM - 2:25PM", you'll want a robust parser.
-        // Strongly recommend Start/End columns to avoid parsing headaches.
-        const [startPart, endPart] = String(timeStr).split("-").map(s => s.trim());
-        if (!DAY_INDEX.hasOwnProperty(dayCode) || !startPart || !endPart) return null;
+        const title = String(titleRaw).trim() || "Available";
+        const dayCode = normalizeDay(dayRaw, title);
 
-        function parseAmPm(s) {
-          // Basic "1:20PM" style parsing
-          const m = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-          if (!m) return null;
-          let hh = Number(m[1]), mm = Number(m[2]);
-          const ap = m[3].toUpperCase();
-          if (ap === "PM" && hh !== 12) hh += 12;
-          if (ap === "AM" && hh === 12) hh = 0;
-          return { hh, mm };
+        if (!DAY_INDEX.hasOwnProperty(dayCode)) {
+          problems.push(`Skipping row (bad/missing Day): title="${title}", Day="${dayRaw}"`);
+          continue;
         }
 
-        const sTime = parseAmPm(startPart.replace(/\s+/g, ""));
-        const eTime = parseAmPm(endPart.replace(/\s+/g, ""));
-        if (!sTime || !eTime) return null;
+        const tr = parseTimeRange(timeRaw);
+        if (!tr) {
+          problems.push(`Skipping row (bad Time format): title="${title}", Time="${timeRaw}"`);
+          continue;
+        }
 
         const dayOffset = DAY_INDEX[dayCode];
+
         const start = new Date(weekStart);
         start.setDate(start.getDate() + dayOffset);
-        start.setHours(sTime.hh, sTime.mm, 0, 0);
+        start.setHours(tr.start.hh, tr.start.mm, 0, 0);
 
         const end = new Date(weekStart);
         end.setDate(end.getDate() + dayOffset);
-        end.setHours(eTime.hh, eTime.mm, 0, 0);
+        end.setHours(tr.end.hh, tr.end.mm, 0, 0);
 
-        return {
+        // Handle accidental end-before-start (rare, but protects against formatting mistakes)
+        if (end <= start) {
+          problems.push(`Skipping row (end <= start): title="${title}", Time="${timeRaw}"`);
+          continue;
+        }
+
+        events.push({
           title,
           start: start.toISOString(),
           end: end.toISOString(),
-          extendedProps: { location },
-        };
-      }).filter(Boolean);
+          extendedProps: { location }
+        });
+      }
+
+      // If there were parsing problems, surface them in console for debugging without breaking the page
+      if (problems.length) {
+        console.warn("Some rows were skipped due to formatting issues:\n" + problems.join("\n"));
+      }
+
+      return events;
     }
 
     async function init() {
-      const rows = await fetchSheetRows();
+      if (!API_KEY || API_KEY.includes("AIzaSyCLYdL-iAyWAPuSIoqALOZOPTXIitXvUMQ")) {
+        showError("Configuration error: Please set API_KEY to your (restricted) Google Sheets API key.");
+        return;
+      }
+
+      const rows = await fetchSheetRowsViaApi();
       const events = buildEvents(rows);
 
       const calendarEl = document.getElementById("calendar");
       const calendar = new FullCalendar.Calendar(calendarEl, {
         initialView: "timeGridWeek",
-        firstDay: 0,              // Sunday
+        firstDay: 0,            // Sunday
         allDaySlot: false,
         nowIndicator: true,
         height: "auto",
         slotMinTime: "07:00:00",
         slotMaxTime: "22:00:00",
         events,
+
         eventDidMount: function(info) {
           const loc = info.event.extendedProps.location;
           if (loc) info.el.title = loc;
@@ -140,9 +243,16 @@
     }
 
     init().catch(err => {
-      document.getElementById("calendar").innerHTML =
-        `<p style="padding:12px;">Error loading calendar data. Please check sheet access and column headers.</p>`;
       console.error(err);
+      showError(
+        "Error loading calendar data.\n\n" +
+        (err && err.message ? err.message : String(err)) +
+        "\n\nTroubleshooting:\n" +
+        "1) Confirm the sheet tab name matches SHEET_NAME.\n" +
+        "2) Confirm headers include: Event Type, Day, Time, Location.\n" +
+        "3) Confirm your API key is valid and restricted to your GitHub Pages referrer.\n" +
+        "4) Confirm the Google Sheets API is enabled in your Google Cloud project."
+      );
     });
   </script>
 </body>
