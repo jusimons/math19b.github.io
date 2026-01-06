@@ -5,20 +5,16 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Weekly Block Schedule</title>
 
-  <!-- FullCalendar (no build step) -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.css">
   <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
 
-  <!-- PapaParse for CSV parsing -->
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
   <style>
     body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
     #wrap { padding: 12px; }
-    #status { font-size: 12px; opacity: 0.75; margin: 6px 0 10px; }
+    #status { font-size: 12px; opacity: 0.8; margin: 6px 0 10px; white-space: pre-wrap; }
     #calendar { max-width: 1200px; margin: 0 auto; }
-
-    /* Slightly tighter header row */
     .fc .fc-col-header-cell-cushion { padding: 6px 4px; }
   </style>
 </head>
@@ -36,6 +32,14 @@
 const CSV_URL =
   "https://docs.google.com/spreadsheets/d/e/2PACX-1vQMfXXgtx0YwUqkmvNPdQgzyiilhkiLMW9KZ2NrWsMx_tuj9GqfGLHHHQNuIFKaSCuQ1MxKwpYyAPlQ/pub?gid=0&single=true&output=csv";
 
+/**
+ * If direct fetch is blocked by CORS, this proxy will usually work.
+ * You can replace this later with your own Apps Script proxy for more control.
+ */
+function proxied(url) {
+  return "https://api.allorigins.win/raw?url=" + encodeURIComponent(url);
+}
+
 // Your exact header names
 const COL = {
   day: "Day",
@@ -47,13 +51,13 @@ const COL = {
 };
 
 // Calendar display defaults
-const WEEK_START = 0; // 0 = Sunday
+const WEEK_START = 0; // Sunday
 const SLOT_MIN_TIME = "07:00:00";
 const SLOT_MAX_TIME = "20:00:00";
 
 // Auto-refresh behavior
-const REFRESH_EVERY_MINUTES = 15; // periodic refresh
-const DAILY_REFRESH_HOUR = 8;     // 8:00am local time
+const REFRESH_EVERY_MINUTES = 15;
+const DAILY_REFRESH_HOUR = 8;
 const DAILY_REFRESH_MINUTE = 0;
 
 /** =========================
@@ -90,11 +94,10 @@ function dayToDow(dayStr) {
 }
 
 function timeSerialToHHMM(serialStr) {
-  // Google Sheets may export times as a fraction of a day (e.g., 0.5 = 12:00).
   const x = Number(serialStr);
   if (!Number.isFinite(x)) return null;
 
-  // If x is a pure time fraction
+  // time fraction (0..1)
   if (x >= 0 && x < 1) {
     const totalMinutes = Math.round(x * 24 * 60);
     const hh = String(Math.floor(totalMinutes / 60) % 24).padStart(2, "0");
@@ -102,7 +105,7 @@ function timeSerialToHHMM(serialStr) {
     return `${hh}:${mm}`;
   }
 
-  // If it's a full date-time serial, keep fractional part as time
+  // date-time serial (>=1): keep fractional part
   if (x >= 1) {
     const frac = x - Math.floor(x);
     const totalMinutes = Math.round(frac * 24 * 60);
@@ -118,27 +121,23 @@ function toTimeHHMM(value) {
   const s = norm(value);
   if (!s) return null;
 
-  // Numeric time serial (Sheets)
+  // numeric serial
   if (/^-?\d+(\.\d+)?$/.test(s)) {
     const hhmm = timeSerialToHHMM(s);
     if (hhmm) return hhmm;
   }
 
-  // 24-hour time: H:MM, HH:MM, optional seconds
+  // 24-hour "H:MM" / "HH:MM" (ignore seconds if present)
   if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) {
-    const parts = s.split(":");
-    const hh = String(parts[0]).padStart(2, "0");
-    const mm = parts[1];
-    return `${hh}:${mm}`;
+    const [h, m] = s.split(":");
+    return `${String(h).padStart(2, "0")}:${m}`;
   }
 
-  // AM/PM time
+  // AM/PM
   if (/[ap]m/i.test(s)) {
     const dt = new Date(`2000-01-01 ${s}`);
     if (!isNaN(dt.getTime())) {
-      const hh = String(dt.getHours()).padStart(2, "0");
-      const mm = String(dt.getMinutes()).padStart(2, "0");
-      return `${hh}:${mm}`;
+      return `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`;
     }
   }
 
@@ -146,26 +145,21 @@ function toTimeHHMM(value) {
 }
 
 function parseTimeslot(timeslotStr) {
-  // Accepts: "8:00-9:15", "8:00 AM - 9:15 AM", "08:00–09:15", etc.
   const s = norm(timeslotStr).replace(/[–—]/g, "-");
   if (!s) return { startTime: null, endTime: null };
 
   const parts = s.split("-").map(x => x.trim()).filter(Boolean);
   if (parts.length < 2) return { startTime: null, endTime: null };
 
-  const startTime = toTimeHHMM(parts[0]);
-  const endTime = toTimeHHMM(parts[1]);
-  return { startTime, endTime };
+  return { startTime: toTimeHHMM(parts[0]), endTime: toTimeHHMM(parts[1]) };
 }
 
 function rowToRecurringEvent(row) {
   const dow = dayToDow(row[COL.day]);
 
-  // Prefer explicit Start/End when present
   let startTime = toTimeHHMM(row[COL.start]);
   let endTime = toTimeHHMM(row[COL.end]);
 
-  // Fallback: parse Timeslot if Start/End are missing/invalid
   if ((!startTime || !endTime) && COL.timeslot) {
     const t = parseTimeslot(row[COL.timeslot]);
     startTime = startTime || t.startTime;
@@ -179,25 +173,36 @@ function rowToRecurringEvent(row) {
   if (dow === null || !startTime || !endTime) return null;
 
   const title =
-    purpose
-      ? (location ? `${purpose} (${location})` : purpose)
-      : (location ? `Block (${location})` : "Block");
+    purpose ? (location ? `${purpose} (${location})` : purpose)
+            : (location ? `Block (${location})` : "Block");
 
   return {
     title,
-    daysOfWeek: [dow],  // recurring weekly
+    daysOfWeek: [dow],
     startTime,
     endTime,
     extendedProps: { location, purpose, timeslot }
   };
 }
 
+async function fetchTextWithFallback(url) {
+  // 1) try direct fetch
+  try {
+    const r1 = await fetch(cacheBustedUrl(url), { cache: "no-store" });
+    if (r1.ok) return await r1.text();
+    throw new Error(`Direct fetch failed: ${r1.status} ${r1.statusText}`);
+  } catch (e1) {
+    // 2) try via proxy
+    const r2 = await fetch(cacheBustedUrl(proxied(url)), { cache: "no-store" });
+    if (!r2.ok) throw new Error(`Proxy fetch failed: ${r2.status} ${r2.statusText}`);
+    return await r2.text();
+  }
+}
+
 async function fetchRecurringEventsFromCsv() {
   setStatus("Fetching schedule…");
 
-  const resp = await fetch(cacheBustedUrl(CSV_URL), { cache: "no-store" });
-  if (!resp.ok) throw new Error(`CSV fetch failed: ${resp.status} ${resp.statusText}`);
-  const csvText = await resp.text();
+  const csvText = await fetchTextWithFallback(CSV_URL);
 
   const parsed = Papa.parse(csvText, {
     header: true,
@@ -206,27 +211,28 @@ async function fetchRecurringEventsFromCsv() {
     transformHeader: (h) =>
       (h ?? "")
         .toString()
-        .replace(/^\uFEFF/, "")  // BOM
-        .replace(/\t/g, "")      // tabs
-        .replace(/\s+/g, " ")    // collapse odd whitespace
+        .replace(/^\uFEFF/, "")
+        .replace(/\t/g, "")
+        .replace(/\s+/g, " ")
         .trim()
   });
 
   const rows = parsed.data || [];
   const headers = parsed.meta?.fields || [];
 
-  // Validate required columns exist
-  for (const k of [COL.day, COL.start, COL.end, COL.timeslot]) {
-    // We require Day, and either Start/End OR Timeslot. We'll check Day now; others are validated by parsing.
-    if (k === COL.day && !headers.includes(k)) {
-      console.warn("Parsed headers:", headers);
-      throw new Error(`Could not find required column "${k}". Parsed headers: ${headers.join(" | ")}`);
-    }
+  if (!headers.includes(COL.day)) {
+    throw new Error(`CSV parsed, but missing "${COL.day}" header. Parsed headers: ${headers.join(" | ")}`);
   }
 
   const events = rows.map(rowToRecurringEvent).filter(Boolean);
 
-  setStatus(`Loaded ${events.length} blocks. Last updated: ${new Date().toLocaleString()}`);
+  // Useful debug info in the status area
+  setStatus(
+    `Loaded ${events.length} blocks.\n` +
+    `Parsed headers: ${headers.join(" | ")}\n` +
+    `Last updated: ${new Date().toLocaleString()}`
+  );
+
   return events;
 }
 
@@ -266,14 +272,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     slotMaxTime: SLOT_MAX_TIME,
     nowIndicator: false,
 
-    // One-page weekly schedule; no navigation; no date numbers
+    // One-page weekly schedule; no navigation; weekday-only headers (no dates)
     headerToolbar: { left: "", center: "", right: "" },
-
-    // Force weekday-only headers (no dates)
-    dayHeaderContent: (arg) => {
-      // arg.date is a Date; we render only the weekday name
-      return new Intl.DateTimeFormat(undefined, { weekday: "long" }).format(arg.date);
-    },
+    dayHeaderContent: (arg) =>
+      new Intl.DateTimeFormat(undefined, { weekday: "long" }).format(arg.date),
 
     eventDidMount: (info) => {
       const p = info.event.extendedProps?.purpose;
