@@ -2,228 +2,230 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Weekly Availability</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CSV Block Calendar</title>
 
-  <!-- FullCalendar (CDN) -->
-  <link href="https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/index.global.min.css" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/@fullcalendar/timegrid@6.1.15/index.global.min.css" rel="stylesheet">
-  <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/index.global.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/timegrid@6.1.15/index.global.min.js"></script>
+  <!-- FullCalendar (no build step) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
+
+  <!-- PapaParse for CSV parsing -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
   <style>
-    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; color:#111; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
     #wrap { padding: 12px; }
-    #calendar { margin-top: 8px; }
-    .note { font-size: 14px; line-height: 1.4; margin: 0 0 10px 0; }
-    .error {
-      border: 1px solid #ddd; background: #fafafa; padding: 10px; border-radius: 8px;
-      margin-top: 10px; white-space: pre-wrap;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-size: 12px; color:#222;
-    }
+    #status { font-size: 12px; opacity: 0.75; margin: 6px 0 10px; }
+    #calendar { max-width: 1200px; margin: 0 auto; }
   </style>
 </head>
 
 <body>
   <div id="wrap">
-    <p class="note">Weekly schedule (auto-updates from Google Sheets). Refresh if something looks stale.</p>
+    <div id="status">Loading…</div>
     <div id="calendar"></div>
-    <div id="errorBox" class="error" style="display:none;"></div>
   </div>
 
-  <script>
-    // ======================
-    // CONFIG — YOUR SHEET
-    // ======================
-    const SHEET_ID = "1LkjDR3JC-L5n8zoEQEzJJOoGLvgzfTahEwQcZCbGghc";
-    const SHEET_NAME = "Sheet1";
-    const RANGE_A1 = `${SHEET_NAME}!A:D`;
+<script>
+/** =========================
+ *  CONFIG
+ *  ========================= */
 
-    // IMPORTANT: use a rotated + restricted key (Sheets API only; referrer restricted to your GitHub Pages domain)
-    const API_KEY = "YOUR_API_KEY_HERE";
+/** Your published CSV URL */
+const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQMfXXgtx0YwUqkmvNPdQgzyiilhkiLMW9KZ2NrWsMx_tuj9GqfGLHHHQNuIFKaSCuQ1MxKwpYyAPlQ/pub?gid=0&single=true&output=csv";
 
-    // Exact headers in your sheet:
-    const COL_EVENT = "Event Type";
-    const COL_DAY = "Day";
-    const COL_TIME = "Time";
-    const COL_LOCATION = "Location";
+/**
+ * COLUMN MAPPING
+ * Update these to match your CSV header row exactly.
+ *
+ * Common patterns:
+ *  - date + start + end (best)
+ *  - start_datetime + end_datetime
+ */
+const COL = {
+  title: "title",            // e.g., "Title", "Event", "Assignment"
+  date: "date",              // e.g., "Date" (YYYY-MM-DD)
+  start: "start",            // e.g., "Start" (HH:MM or HH:MM AM/PM)
+  end: "end",                // e.g., "End"
+  startDatetime: "start_datetime", // optional alternative
+  endDatetime: "end_datetime",     // optional alternative
+  location: "location",      // optional
+  category: "category",      // optional (used for coloring if present)
+  color: "color"             // optional (hex like #3b82f6)
+};
 
-    // Sunday-start week
-    const DAY_INDEX = { Su: 0, Mo: 1, Tu: 2, We: 3, Th: 4, Fr: 5, Sa: 6 };
+/** Display defaults */
+const DEFAULT_VIEW = "timeGridWeek";     // timeGridWeek gives “block schedule” feel
+const WEEK_START = 1;                    // 0=Sunday, 1=Monday
+const SLOT_MIN_TIME = "07:00:00";
+const SLOT_MAX_TIME = "20:00:00";
 
-    function showError(msg) {
-      const box = document.getElementById("errorBox");
-      box.style.display = "block";
-      box.textContent = msg;
+/** Auto-refresh behavior */
+const REFRESH_EVERY_MINUTES = 15;        // periodic refresh
+const DAILY_REFRESH_HOUR = 8;            // refresh at 8:00am local time
+const DAILY_REFRESH_MINUTE = 0;
+
+/** =========================
+ *  IMPLEMENTATION
+ *  ========================= */
+
+let calendar;
+
+function setStatus(msg) {
+  document.getElementById("status").textContent = msg;
+}
+
+function cacheBustedUrl(url) {
+  const u = new URL(url);
+  u.searchParams.set("_cb", Date.now().toString());
+  return u.toString();
+}
+
+function normalizeTime(t) {
+  // Accepts "9:00", "09:00", "9:00 AM", etc. Leaves parsing to Date where possible.
+  return (t || "").trim();
+}
+
+function toISODate(d) {
+  return (d || "").trim(); // expect YYYY-MM-DD
+}
+
+function buildDateTime(dateStr, timeStr) {
+  // Produces "YYYY-MM-DDTHH:MM" (FullCalendar can parse this)
+  const d = toISODate(dateStr);
+  const t = normalizeTime(timeStr);
+  if (!d || !t) return null;
+
+  // If user uses AM/PM, let the Date parser interpret by building a local Date.
+  if (/[ap]m/i.test(t)) {
+    const dt = new Date(`${d} ${t}`);
+    if (isNaN(dt.getTime())) return null;
+    return dt.toISOString(); // FullCalendar accepts ISO; will render in local tz by default
+  }
+  // 24-hour time:
+  return `${d}T${t}`;
+}
+
+function rowToEvent(row) {
+  const title = (row[COL.title] || "").toString().trim() || "Untitled";
+
+  // Two supported schemas:
+  // A) date + start + end
+  // B) start_datetime + end_datetime
+  let start = null;
+  let end = null;
+
+  if (row[COL.startDatetime] && row[COL.endDatetime]) {
+    start = new Date(row[COL.startDatetime]);
+    end = new Date(row[COL.endDatetime]);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) return null;
+    start = start.toISOString();
+    end = end.toISOString();
+  } else {
+    start = buildDateTime(row[COL.date], row[COL.start]);
+    end = buildDateTime(row[COL.date], row[COL.end]);
+    if (!start || !end) return null;
+  }
+
+  const location = (row[COL.location] || "").toString().trim();
+  const category = (row[COL.category] || "").toString().trim();
+  const color = (row[COL.color] || "").toString().trim();
+
+  const evt = {
+    title,
+    start,
+    end
+  };
+
+  // Optional display enhancements
+  if (location) evt.extendedProps = { location, category };
+  if (color) evt.backgroundColor = color, evt.borderColor = color;
+
+  // If no explicit color but category exists, you can add a simple deterministic hash color:
+  // (left out to avoid “mystery colors”; add if you want.)
+  return evt;
+}
+
+async function fetchEventsFromCsv() {
+  setStatus("Fetching CSV…");
+
+  const resp = await fetch(cacheBustedUrl(CSV_URL), { cache: "no-store" });
+  if (!resp.ok) throw new Error(`CSV fetch failed: ${resp.status} ${resp.statusText}`);
+  const csvText = await resp.text();
+
+  const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
+  if (parsed.errors?.length) {
+    // non-fatal parse errors may exist; still try
+    console.warn(parsed.errors);
+  }
+
+  const rows = parsed.data || [];
+  const events = rows.map(rowToEvent).filter(Boolean);
+
+  setStatus(`Loaded ${events.length} events. Last updated: ${new Date().toLocaleString()}`);
+  return events;
+}
+
+async function refreshCalendar() {
+  try {
+    const events = await fetchEventsFromCsv();
+    calendar.removeAllEvents();
+    calendar.addEventSource(events);
+  } catch (e) {
+    console.error(e);
+    setStatus(`Error: ${e.message}`);
+  }
+}
+
+function scheduleDailyRefreshAt(hour, minute) {
+  function msUntilNextTrigger() {
+    const now = new Date();
+    const next = new Date(now);
+    next.setHours(hour, minute, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    return next - now;
+  }
+  setTimeout(async function run() {
+    await refreshCalendar();
+    setTimeout(run, 24 * 60 * 60 * 1000); // repeat daily
+  }, msUntilNextTrigger());
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  const el = document.getElementById("calendar");
+  calendar = new FullCalendar.Calendar(el, {
+    initialView: DEFAULT_VIEW,
+    firstDay: WEEK_START,
+    nowIndicator: true,
+    height: "auto",
+    slotMinTime: SLOT_MIN_TIME,
+    slotMaxTime: SLOT_MAX_TIME,
+    allDaySlot: false,
+    expandRows: true,
+    eventTimeFormat: { hour: "numeric", minute: "2-digit" },
+    headerToolbar: {
+      left: "prev,next today",
+      center: "title",
+      right: "timeGridDay,timeGridWeek,dayGridMonth"
+    },
+    eventDidMount: function(info) {
+      // Show location in tooltip if present
+      const loc = info.event.extendedProps?.location;
+      if (loc) info.el.title = loc;
     }
+  });
 
-    function startOfWeekSunday(d) {
-      const date = new Date(d);
-      date.setHours(0, 0, 0, 0);
-      const diff = date.getDay(); // 0=Sun
-      date.setDate(date.getDate() - diff);
-      return date;
-    }
+  calendar.render();
+  await refreshCalendar();
 
-    function normalizeDay(rawDay, eventTypeMaybe) {
-      let d = String(rawDay || "").trim();
+  // Periodic refresh
+  if (REFRESH_EVERY_MINUTES > 0) {
+    setInterval(refreshCalendar, REFRESH_EVERY_MINUTES * 60 * 1000);
+  }
 
-      // Recover day code if it was accidentally appended to the event type, e.g. "Office Hours (Simons)Fr"
-      if ((!d || d.length < 2) && eventTypeMaybe) {
-        const m = String(eventTypeMaybe).match(/\b(Su|Mo|Tu|We|Th|Fr|Sa|Ft|Thu|Tue)\b/);
-        if (m) d = m[1];
-      }
-
-      // Normalize common variants/typos
-      if (d === "Ft") d = "Fr";   // observed in your sheet
-      if (d === "F") d = "Fr";
-      if (d === "Thu") d = "Th";
-      if (d === "Tue") d = "Tu";
-
-      return d;
-    }
-
-    function parseTimeRange(timeStr) {
-      // Accepts: "1:20PM - 2:25PM" (spaces optional)
-      const raw = String(timeStr || "").trim();
-      const parts = raw.split("-").map(s => s.trim());
-      if (parts.length !== 2) return null;
-
-      const startPart = parts[0].replace(/\s+/g, "");
-      const endPart = parts[1].replace(/\s+/g, "");
-
-      function parseAmPm(s) {
-        const m = s.match(/^(\d{1,2}):(\d{2})(AM|PM)$/i);
-        if (!m) return null;
-        let hh = Number(m[1]);
-        const mm = Number(m[2]);
-        const ap = m[3].toUpperCase();
-        if (ap === "PM" && hh !== 12) hh += 12;
-        if (ap === "AM" && hh === 12) hh = 0;
-        return { hh, mm };
-      }
-
-      const sTime = parseAmPm(startPart);
-      const eTime = parseAmPm(endPart);
-      if (!sTime || !eTime) return null;
-      return { start: sTime, end: eTime };
-    }
-
-    async function fetchSheetRowsViaApi() {
-      const url =
-        `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(RANGE_A1)}?key=${API_KEY}`;
-
-      const res = await fetch(url);
-      const text = await res.text();
-
-      if (!res.ok) {
-        throw new Error(`Sheets API request failed (${res.status}).\n${text}`);
-      }
-
-      const data = JSON.parse(text);
-      const values = data.values || [];
-      if (values.length < 2) return [];
-
-      const headers = values[0].map(h => String(h).trim());
-      return values.slice(1)
-        .filter(row => row.some(cell => String(cell || "").trim() !== ""))
-        .map(row => Object.fromEntries(headers.map((h, i) => [h, row[i] ?? ""])));
-    }
-
-    function buildEvents(sheetRows) {
-      const weekStart = startOfWeekSunday(new Date());
-      const events = [];
-      const problems = [];
-
-      for (const row of sheetRows) {
-        const titleRaw = row[COL_EVENT] ?? "";
-        const dayRaw = row[COL_DAY] ?? "";
-        const timeRaw = row[COL_TIME] ?? "";
-        const location = row[COL_LOCATION] ?? "";
-
-        const title = String(titleRaw).trim() || "Available";
-        const dayCode = normalizeDay(dayRaw, title);
-
-        if (!DAY_INDEX.hasOwnProperty(dayCode)) {
-          problems.push(`Skipped (bad Day): Event Type="${titleRaw}" Day="${dayRaw}" Time="${timeRaw}"`);
-          continue;
-        }
-
-        const tr = parseTimeRange(timeRaw);
-        if (!tr) {
-          problems.push(`Skipped (bad Time): Event Type="${titleRaw}" Day="${dayRaw}" Time="${timeRaw}"`);
-          continue;
-        }
-
-        const start = new Date(weekStart);
-        start.setDate(start.getDate() + DAY_INDEX[dayCode]);
-        start.setHours(tr.start.hh, tr.start.mm, 0, 0);
-
-        const end = new Date(weekStart);
-        end.setDate(end.getDate() + DAY_INDEX[dayCode]);
-        end.setHours(tr.end.hh, tr.end.mm, 0, 0);
-
-        if (end <= start) {
-          problems.push(`Skipped (end<=start): Event Type="${titleRaw}" Day="${dayRaw}" Time="${timeRaw}"`);
-          continue;
-        }
-
-        events.push({
-          title,
-          start: start.toISOString(),
-          end: end.toISOString(),
-          extendedProps: { location }
-        });
-      }
-
-      if (problems.length) {
-        console.warn("Some rows were skipped due to formatting issues:\n" + problems.join("\n"));
-      }
-
-      return events;
-    }
-
-    async function init() {
-      if (!API_KEY || API_KEY.includes("YOUR_API_KEY_HERE")) {
-        showError("Configuration error: Please set API_KEY to your (restricted) Google Sheets API key.");
-        return;
-      }
-
-      const rows = await fetchSheetRowsViaApi();
-      const events = buildEvents(rows);
-
-      const calendarEl = document.getElementById("calendar");
-      const calendar = new FullCalendar.Calendar(calendarEl, {
-        initialView: "timeGridWeek",
-        firstDay: 0, // Sunday
-        allDaySlot: false,
-        nowIndicator: true,
-        height: "auto",
-        slotMinTime: "07:00:00",
-        slotMaxTime: "22:00:00",
-        events,
-        eventDidMount: function(info) {
-          const loc = info.event.extendedProps.location;
-          if (loc) info.el.title = loc;
-        }
-      });
-
-      calendar.render();
-    }
-
-    init().catch(err => {
-      console.error(err);
-      showError(
-        "Error loading calendar data.\n\n" +
-        (err && err.message ? err.message : String(err)) +
-        "\n\nChecklist:\n" +
-        "• Is the Google Sheets API enabled for this key?\n" +
-        "• Is the key restricted to your GitHub Pages referrer?\n" +
-        "• Is the sheet/tab name 'Sheet1' (it is, per your link)?\n" +
-        "• Do headers match: Event Type, Day, Time, Location?"
-      );
-    });
-  </script>
+  // Daily refresh at 8:00am local time
+  scheduleDailyRefreshAt(DAILY_REFRESH_HOUR, DAILY_REFRESH_MINUTE);
+});
+</script>
 </body>
 </html>
