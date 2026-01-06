@@ -74,17 +74,59 @@ function detectDelimiter(text) {
 }
 
 function dayToDow(dayStr) {
-  const d = norm(dayStr).toLowerCase();
+  const d = norm(dayStr).toLowerCase().replace(/\./g, "");
   const map = {
-    sun: 0, sunday: 0,
-    mon: 1, monday: 1,
-    tue: 2, tues: 2, tuesday: 2,
-    wed: 3, weds: 3, wednesday: 3,
-    thu: 4, thur: 4, thurs: 4, thursday: 4,
-    fri: 5, friday: 5,
-    sat: 6, saturday: 6
+    sun: 0, sunday: 0, su: 0,
+    mon: 1, monday: 1, mo: 1, m: 1,
+    tue: 2, tues: 2, tuesday: 2, tu: 2, t: 2,
+    wed: 3, weds: 3, wednesday: 3, we: 3, w: 3,
+    thu: 4, thur: 4, thurs: 4, thursday: 4, th: 4, r: 4,
+    fri: 5, friday: 5, fr: 5, f: 5,
+    sat: 6, saturday: 6, sa: 6
   };
   return map[d] ?? null;
+}
+
+function parseTimeslot(timeslotStr) {
+  // Accepts: "8:00-9:15", "8:00 AM - 9:15 AM", "08:00–09:15", etc.
+  const s = norm(timeslotStr).replace(/[–—]/g, "-");
+  if (!s) return { startTime: null, endTime: null };
+
+  const parts = s.split("-").map(x => x.trim()).filter(Boolean);
+  if (parts.length < 2) return { startTime: null, endTime: null };
+
+  // Reuse your existing toTimeHHMM() for each side
+  const startTime = toTimeHHMM(parts[0]);
+  const endTime = toTimeHHMM(parts[1]);
+  return { startTime, endTime };
+}
+
+function rowToRecurringEvent(row) {
+  const dow = dayToDow(row[COL.day]);
+
+  // Prefer explicit Start/End
+  let startTime = toTimeHHMM(row[COL.start]);
+  let endTime = toTimeHHMM(row[COL.end]);
+
+  // Fallback: parse Timeslot if Start/End missing
+  if ((!startTime || !endTime) && COL.timeslot) {
+    const t = parseTimeslot(row[COL.timeslot]);
+    startTime = startTime || t.startTime;
+    endTime = endTime || t.endTime;
+  }
+
+  const purpose = norm(row[COL.purpose]);
+  const location = norm(row[COL.location]);
+
+  if (dow === null || !startTime || !endTime) return null;
+
+  return {
+    title: purpose ? (location ? `${purpose} (${location})` : purpose) : (location ? `Block (${location})` : "Block"),
+    daysOfWeek: [dow],
+    startTime,
+    endTime,
+    extendedProps: { location, purpose, timeslot: norm(row[COL.timeslot]) }
+  };
 }
 
 function timeSerialToHHMM(serial) {
