@@ -5,8 +5,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Weekly Block Schedule</title>
 
+  <!-- FullCalendar (no build step) -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.css">
   <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
+
+  <!-- PapaParse for CSV parsing -->
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
   <style>
@@ -14,8 +17,12 @@
     #wrap { padding: 12px; }
     #status { font-size: 12px; opacity: 0.75; margin: 6px 0 10px; }
     #calendar { max-width: 1200px; margin: 0 auto; }
+
+    /* Slightly tighter header row */
+    .fc .fc-col-header-cell-cushion { padding: 6px 4px; }
   </style>
 </head>
+
 <body>
   <div id="wrap">
     <div id="status">Loading…</div>
@@ -26,28 +33,31 @@
 /** =========================
  * CONFIG
  * ========================= */
-const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQMfXXgtx0YwUqkmvNPdQgzyiilhkiLMW9KZ2NrWsMx_tuj9GqfGLHHHQNuIFKaSCuQ1MxKwpYyAPlQ/pub?gid=0&single=true&output=csv";
+const CSV_URL =
+  "https://docs.google.com/spreadsheets/d/e/2PACX-1vQMfXXgtx0YwUqkmvNPdQgzyiilhkiLMW9KZ2NrWsMx_tuj9GqfGLHHHQNuIFKaSCuQ1MxKwpYyAPlQ/pub?gid=0&single=true&output=csv";
 
-// Explicit header mapping (exactly as you provided)
+// Your exact header names
 const COL = {
   day: "Day",
-  start: "Start",
-  end: "End",
-  purpose: "Purpose",
+  timeslot: "Timeslot",
   location: "Location",
-  timeslot: "Timeslot"
+  purpose: "Purpose",
+  start: "Start",
+  end: "End"
 };
 
-const WEEK_START = 0; // Sunday
+// Calendar display defaults
+const WEEK_START = 0; // 0 = Sunday
 const SLOT_MIN_TIME = "07:00:00";
 const SLOT_MAX_TIME = "20:00:00";
 
-const REFRESH_EVERY_MINUTES = 15;
-const DAILY_REFRESH_HOUR = 8;
+// Auto-refresh behavior
+const REFRESH_EVERY_MINUTES = 15; // periodic refresh
+const DAILY_REFRESH_HOUR = 8;     // 8:00am local time
 const DAILY_REFRESH_MINUTE = 0;
 
 /** =========================
- * Helpers
+ * IMPLEMENTATION
  * ========================= */
 let calendar;
 
@@ -65,14 +75,6 @@ function norm(v) {
   return (v ?? "").toString().trim();
 }
 
-function detectDelimiter(text) {
-  // Look at the first non-empty line
-  const firstLine = text.split(/\r?\n/).find(l => l.trim().length > 0) || "";
-  const tabs = (firstLine.match(/\t/g) || []).length;
-  const commas = (firstLine.match(/,/g) || []).length;
-  return tabs > commas ? "\t" : ",";
-}
-
 function dayToDow(dayStr) {
   const d = norm(dayStr).toLowerCase().replace(/\./g, "");
   const map = {
@@ -87,51 +89,9 @@ function dayToDow(dayStr) {
   return map[d] ?? null;
 }
 
-function parseTimeslot(timeslotStr) {
-  // Accepts: "8:00-9:15", "8:00 AM - 9:15 AM", "08:00–09:15", etc.
-  const s = norm(timeslotStr).replace(/[–—]/g, "-");
-  if (!s) return { startTime: null, endTime: null };
-
-  const parts = s.split("-").map(x => x.trim()).filter(Boolean);
-  if (parts.length < 2) return { startTime: null, endTime: null };
-
-  // Reuse your existing toTimeHHMM() for each side
-  const startTime = toTimeHHMM(parts[0]);
-  const endTime = toTimeHHMM(parts[1]);
-  return { startTime, endTime };
-}
-
-function rowToRecurringEvent(row) {
-  const dow = dayToDow(row[COL.day]);
-
-  // Prefer explicit Start/End
-  let startTime = toTimeHHMM(row[COL.start]);
-  let endTime = toTimeHHMM(row[COL.end]);
-
-  // Fallback: parse Timeslot if Start/End missing
-  if ((!startTime || !endTime) && COL.timeslot) {
-    const t = parseTimeslot(row[COL.timeslot]);
-    startTime = startTime || t.startTime;
-    endTime = endTime || t.endTime;
-  }
-
-  const purpose = norm(row[COL.purpose]);
-  const location = norm(row[COL.location]);
-
-  if (dow === null || !startTime || !endTime) return null;
-
-  return {
-    title: purpose ? (location ? `${purpose} (${location})` : purpose) : (location ? `Block (${location})` : "Block"),
-    daysOfWeek: [dow],
-    startTime,
-    endTime,
-    extendedProps: { location, purpose, timeslot: norm(row[COL.timeslot]) }
-  };
-}
-
-function timeSerialToHHMM(serial) {
-  // Google Sheets may export a time as a fraction of a day: 0.5 = 12:00
-  const x = Number(serial);
+function timeSerialToHHMM(serialStr) {
+  // Google Sheets may export times as a fraction of a day (e.g., 0.5 = 12:00).
+  const x = Number(serialStr);
   if (!Number.isFinite(x)) return null;
 
   // If x is a pure time fraction
@@ -142,8 +102,7 @@ function timeSerialToHHMM(serial) {
     return `${hh}:${mm}`;
   }
 
-  // If it looks like a Sheets date-time serial (days since 1899-12-30)
-  // Keep only fractional part for time-of-day
+  // If it's a full date-time serial, keep fractional part as time
   if (x >= 1) {
     const frac = x - Math.floor(x);
     const totalMinutes = Math.round(frac * 24 * 60);
@@ -159,21 +118,21 @@ function toTimeHHMM(value) {
   const s = norm(value);
   if (!s) return null;
 
-  // If it’s numeric-ish, try time serial conversion
+  // Numeric time serial (Sheets)
   if (/^-?\d+(\.\d+)?$/.test(s)) {
     const hhmm = timeSerialToHHMM(s);
     if (hhmm) return hhmm;
   }
 
-  // 24-hour "H:MM" or "HH:MM" (optional :SS)
+  // 24-hour time: H:MM, HH:MM, optional seconds
   if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) {
     const parts = s.split(":");
     const hh = String(parts[0]).padStart(2, "0");
     const mm = parts[1];
-    return `${hh}:${mm}`; // FullCalendar accepts HH:MM
+    return `${hh}:${mm}`;
   }
 
-  // AM/PM parsing
+  // AM/PM time
   if (/[ap]m/i.test(s)) {
     const dt = new Date(`2000-01-01 ${s}`);
     if (!isNaN(dt.getTime())) {
@@ -186,68 +145,94 @@ function toTimeHHMM(value) {
   return null;
 }
 
+function parseTimeslot(timeslotStr) {
+  // Accepts: "8:00-9:15", "8:00 AM - 9:15 AM", "08:00–09:15", etc.
+  const s = norm(timeslotStr).replace(/[–—]/g, "-");
+  if (!s) return { startTime: null, endTime: null };
+
+  const parts = s.split("-").map(x => x.trim()).filter(Boolean);
+  if (parts.length < 2) return { startTime: null, endTime: null };
+
+  const startTime = toTimeHHMM(parts[0]);
+  const endTime = toTimeHHMM(parts[1]);
+  return { startTime, endTime };
+}
+
 function rowToRecurringEvent(row) {
   const dow = dayToDow(row[COL.day]);
-  const startTime = toTimeHHMM(row[COL.start]);
-  const endTime = toTimeHHMM(row[COL.end]);
+
+  // Prefer explicit Start/End when present
+  let startTime = toTimeHHMM(row[COL.start]);
+  let endTime = toTimeHHMM(row[COL.end]);
+
+  // Fallback: parse Timeslot if Start/End are missing/invalid
+  if ((!startTime || !endTime) && COL.timeslot) {
+    const t = parseTimeslot(row[COL.timeslot]);
+    startTime = startTime || t.startTime;
+    endTime = endTime || t.endTime;
+  }
 
   const purpose = norm(row[COL.purpose]);
   const location = norm(row[COL.location]);
   const timeslot = norm(row[COL.timeslot]);
 
-  const titleParts = [];
-  if (purpose) titleParts.push(purpose);
-  else titleParts.push("Block");
-
-  // Optional: include location in the title line
-  if (location) titleParts.push(`(${location})`);
-
   if (dow === null || !startTime || !endTime) return null;
 
+  const title =
+    purpose
+      ? (location ? `${purpose} (${location})` : purpose)
+      : (location ? `Block (${location})` : "Block");
+
   return {
-    title: titleParts.join(" "),
-    daysOfWeek: [dow],
+    title,
+    daysOfWeek: [dow],  // recurring weekly
     startTime,
     endTime,
-    extendedProps: { location, timeslot, purpose }
+    extendedProps: { location, purpose, timeslot }
   };
 }
 
-async function fetchRecurringEvents() {
+async function fetchRecurringEventsFromCsv() {
   setStatus("Fetching schedule…");
 
   const resp = await fetch(cacheBustedUrl(CSV_URL), { cache: "no-store" });
-  if (!resp.ok) throw new Error(`Fetch failed: ${resp.status} ${resp.statusText}`);
-  const text = await resp.text();
+  if (!resp.ok) throw new Error(`CSV fetch failed: ${resp.status} ${resp.statusText}`);
+  const csvText = await resp.text();
 
-  const delimiter = detectDelimiter(text);
-  const parsed = Papa.parse(text, {
+  const parsed = Papa.parse(csvText, {
     header: true,
     skipEmptyLines: true,
-    delimiter
+    delimiter: ",",
+    transformHeader: (h) =>
+      (h ?? "")
+        .toString()
+        .replace(/^\uFEFF/, "")  // BOM
+        .replace(/\t/g, "")      // tabs
+        .replace(/\s+/g, " ")    // collapse odd whitespace
+        .trim()
   });
 
   const rows = parsed.data || [];
   const headers = parsed.meta?.fields || [];
 
-  // Hard fail early if the delimiter/header parse is wrong
-  for (const k of [COL.day, COL.start, COL.end]) {
-    if (!headers.includes(k)) {
+  // Validate required columns exist
+  for (const k of [COL.day, COL.start, COL.end, COL.timeslot]) {
+    // We require Day, and either Start/End OR Timeslot. We'll check Day now; others are validated by parsing.
+    if (k === COL.day && !headers.includes(k)) {
       console.warn("Parsed headers:", headers);
-      throw new Error(
-        `Could not find required column "${k}". Parsed headers: ${headers.join(" | ")}`
-      );
+      throw new Error(`Could not find required column "${k}". Parsed headers: ${headers.join(" | ")}`);
     }
   }
 
   const events = rows.map(rowToRecurringEvent).filter(Boolean);
+
   setStatus(`Loaded ${events.length} blocks. Last updated: ${new Date().toLocaleString()}`);
   return events;
 }
 
 async function refreshCalendar() {
   try {
-    const events = await fetchRecurringEvents();
+    const events = await fetchRecurringEventsFromCsv();
     calendar.removeAllEvents();
     calendar.addEventSource(events);
   } catch (e) {
@@ -257,7 +242,7 @@ async function refreshCalendar() {
 }
 
 function scheduleDailyRefreshAt(hour, minute) {
-  function msUntilNext() {
+  function msUntilNextTrigger() {
     const now = new Date();
     const next = new Date(now);
     next.setHours(hour, minute, 0, 0);
@@ -267,7 +252,7 @@ function scheduleDailyRefreshAt(hour, minute) {
   setTimeout(async function run() {
     await refreshCalendar();
     setTimeout(run, 24 * 60 * 60 * 1000);
-  }, msUntilNext());
+  }, msUntilNextTrigger());
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
@@ -279,17 +264,21 @@ document.addEventListener("DOMContentLoaded", async () => {
     allDaySlot: false,
     slotMinTime: SLOT_MIN_TIME,
     slotMaxTime: SLOT_MAX_TIME,
-
-    // One-page weekly view; no dates/navigation chrome
-    headerToolbar: { left: "", center: "", right: "" },
-    dayHeaderFormat: { weekday: "long" },
-
     nowIndicator: false,
 
+    // One-page weekly schedule; no navigation; no date numbers
+    headerToolbar: { left: "", center: "", right: "" },
+
+    // Force weekday-only headers (no dates)
+    dayHeaderContent: (arg) => {
+      // arg.date is a Date; we render only the weekday name
+      return new Intl.DateTimeFormat(undefined, { weekday: "long" }).format(arg.date);
+    },
+
     eventDidMount: (info) => {
-      const loc = info.event.extendedProps?.location;
-      const ts = info.event.extendedProps?.timeslot;
       const p = info.event.extendedProps?.purpose;
+      const ts = info.event.extendedProps?.timeslot;
+      const loc = info.event.extendedProps?.location;
       const tooltip = [p, ts, loc].filter(Boolean).join(" — ");
       if (tooltip) info.el.title = tooltip;
     }
