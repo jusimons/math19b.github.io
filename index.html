@@ -28,10 +28,20 @@
  * ========================= */
 const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQMfXXgtx0YwUqkmvNPdQgzyiilhkiLMW9KZ2NrWsMx_tuj9GqfGLHHHQNuIFKaSCuQ1MxKwpYyAPlQ/pub?gid=0&single=true&output=csv";
 
-/** Calendar look/feel */
+// Explicit header mapping (exactly as you provided)
+const COL = {
+  day: "Day",
+  start: "Start",
+  end: "End",
+  purpose: "Purpose",
+  location: "Location",
+  timeslot: "Timeslot"
+};
+
+const WEEK_START = 0; // Sunday
 const SLOT_MIN_TIME = "07:00:00";
 const SLOT_MAX_TIME = "20:00:00";
-const WEEK_START = 0; // 0 = Sunday
+
 const REFRESH_EVERY_MINUTES = 15;
 const DAILY_REFRESH_HOUR = 8;
 const DAILY_REFRESH_MINUTE = 0;
@@ -51,23 +61,20 @@ function cacheBustedUrl(url) {
   return u.toString();
 }
 
-function norm(s) {
-  return (s ?? "").toString().trim();
+function norm(v) {
+  return (v ?? "").toString().trim();
 }
 
-function findHeader(headers, candidates) {
-  // candidates: array of substrings to match, e.g. ["day", "weekday"]
-  const lower = headers.map(h => h.toLowerCase());
-  for (const cand of candidates) {
-    const idx = lower.findIndex(h => h === cand || h.includes(cand));
-    if (idx >= 0) return headers[idx];
-  }
-  return null;
+function detectDelimiter(text) {
+  // Look at the first non-empty line
+  const firstLine = text.split(/\r?\n/).find(l => l.trim().length > 0) || "";
+  const tabs = (firstLine.match(/\t/g) || []).length;
+  const commas = (firstLine.match(/,/g) || []).length;
+  return tabs > commas ? "\t" : ",";
 }
 
 function dayToDow(dayStr) {
   const d = norm(dayStr).toLowerCase();
-  // Accept "Sun", "Sunday", etc.
   const map = {
     sun: 0, sunday: 0,
     mon: 1, monday: 1,
@@ -80,92 +87,125 @@ function dayToDow(dayStr) {
   return map[d] ?? null;
 }
 
-function toTimeHHMM(t) {
-  // FullCalendar recurring events accept startTime/endTime as "HH:MM" or "HH:MM:SS"
-  // We’ll try to preserve 24h times, and also parse basic AM/PM.
-  const s = norm(t);
-  if (!s) return null;
+function timeSerialToHHMM(serial) {
+  // Google Sheets may export a time as a fraction of a day: 0.5 = 12:00
+  const x = Number(serial);
+  if (!Number.isFinite(x)) return null;
 
-  // If already looks like 24h "HH:MM" or "H:MM"
-  if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) {
-    const [hh, mm, ss] = s.split(":");
-    const H = String(hh).padStart(2, "0");
-    const rest = ss ? `:${ss}` : "";
-    return `${H}:${mm}${rest}`;
+  // If x is a pure time fraction
+  if (x >= 0 && x < 1) {
+    const totalMinutes = Math.round(x * 24 * 60);
+    const hh = String(Math.floor(totalMinutes / 60) % 24).padStart(2, "0");
+    const mm = String(totalMinutes % 60).padStart(2, "0");
+    return `${hh}:${mm}`;
   }
 
-  // If AM/PM, convert using Date parsing with a fixed date.
-  if (/[ap]m/i.test(s)) {
-    const dt = new Date(`2000-01-01 ${s}`);
-    if (isNaN(dt.getTime())) return null;
-    const hh = String(dt.getHours()).padStart(2, "0");
-    const mm = String(dt.getMinutes()).padStart(2, "0");
+  // If it looks like a Sheets date-time serial (days since 1899-12-30)
+  // Keep only fractional part for time-of-day
+  if (x >= 1) {
+    const frac = x - Math.floor(x);
+    const totalMinutes = Math.round(frac * 24 * 60);
+    const hh = String(Math.floor(totalMinutes / 60) % 24).padStart(2, "0");
+    const mm = String(totalMinutes % 60).padStart(2, "0");
     return `${hh}:${mm}`;
   }
 
   return null;
 }
 
-function rowToRecurringEvent(row, keys) {
-  const dow = dayToDow(row[keys.day]);
-  const startTime = toTimeHHMM(row[keys.start]);
-  const endTime = toTimeHHMM(row[keys.end]);
-  const title = norm(row[keys.title]) || "Scheduled Block";
+function toTimeHHMM(value) {
+  const s = norm(value);
+  if (!s) return null;
+
+  // If it’s numeric-ish, try time serial conversion
+  if (/^-?\d+(\.\d+)?$/.test(s)) {
+    const hhmm = timeSerialToHHMM(s);
+    if (hhmm) return hhmm;
+  }
+
+  // 24-hour "H:MM" or "HH:MM" (optional :SS)
+  if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) {
+    const parts = s.split(":");
+    const hh = String(parts[0]).padStart(2, "0");
+    const mm = parts[1];
+    return `${hh}:${mm}`; // FullCalendar accepts HH:MM
+  }
+
+  // AM/PM parsing
+  if (/[ap]m/i.test(s)) {
+    const dt = new Date(`2000-01-01 ${s}`);
+    if (!isNaN(dt.getTime())) {
+      const hh = String(dt.getHours()).padStart(2, "0");
+      const mm = String(dt.getMinutes()).padStart(2, "0");
+      return `${hh}:${mm}`;
+    }
+  }
+
+  return null;
+}
+
+function rowToRecurringEvent(row) {
+  const dow = dayToDow(row[COL.day]);
+  const startTime = toTimeHHMM(row[COL.start]);
+  const endTime = toTimeHHMM(row[COL.end]);
+
+  const purpose = norm(row[COL.purpose]);
+  const location = norm(row[COL.location]);
+  const timeslot = norm(row[COL.timeslot]);
+
+  const titleParts = [];
+  if (purpose) titleParts.push(purpose);
+  else titleParts.push("Block");
+
+  // Optional: include location in the title line
+  if (location) titleParts.push(`(${location})`);
 
   if (dow === null || !startTime || !endTime) return null;
 
-  const evt = {
-    title,
-    daysOfWeek: [dow],     // recurring weekly
+  return {
+    title: titleParts.join(" "),
+    daysOfWeek: [dow],
     startTime,
-    endTime
+    endTime,
+    extendedProps: { location, timeslot, purpose }
   };
-
-  // Optional coloring if you have a color/category column
-  if (keys.color && norm(row[keys.color])) {
-    evt.backgroundColor = norm(row[keys.color]);
-    evt.borderColor = norm(row[keys.color]);
-  }
-
-  return evt;
 }
 
-async function fetchRecurringEventsFromCsv() {
-  setStatus("Fetching CSV…");
+async function fetchRecurringEvents() {
+  setStatus("Fetching schedule…");
+
   const resp = await fetch(cacheBustedUrl(CSV_URL), { cache: "no-store" });
-  if (!resp.ok) throw new Error(`CSV fetch failed: ${resp.status} ${resp.statusText}`);
-  const csvText = await resp.text();
+  if (!resp.ok) throw new Error(`Fetch failed: ${resp.status} ${resp.statusText}`);
+  const text = await resp.text();
 
-  const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
+  const delimiter = detectDelimiter(text);
+  const parsed = Papa.parse(text, {
+    header: true,
+    skipEmptyLines: true,
+    delimiter
+  });
+
   const rows = parsed.data || [];
-  const headers = parsed.meta?.fields || Object.keys(rows[0] || {});
-  if (!headers.length) throw new Error("CSV appears empty or has no header row.");
+  const headers = parsed.meta?.fields || [];
 
-  // Flexible header detection
-  const keys = {
-    day: findHeader(headers, ["day", "weekday"]),
-    start: findHeader(headers, ["start", "begin"]),
-    end: findHeader(headers, ["end", "finish"]),
-    title: findHeader(headers, ["title", "event", "name", "block"]),
-    color: findHeader(headers, ["color", "colour"])
-  };
-
-  if (!keys.day || !keys.start || !keys.end) {
-    console.warn("Detected headers:", headers);
-    console.warn("Detected key mapping:", keys);
-    throw new Error("Could not detect required columns (day/start/end). See console for detected headers.");
+  // Hard fail early if the delimiter/header parse is wrong
+  for (const k of [COL.day, COL.start, COL.end]) {
+    if (!headers.includes(k)) {
+      console.warn("Parsed headers:", headers);
+      throw new Error(
+        `Could not find required column "${k}". Parsed headers: ${headers.join(" | ")}`
+      );
+    }
   }
-  if (!keys.title) keys.title = keys.day; // fallback so something renders
 
-  const events = rows.map(r => rowToRecurringEvent(r, keys)).filter(Boolean);
-
+  const events = rows.map(rowToRecurringEvent).filter(Boolean);
   setStatus(`Loaded ${events.length} blocks. Last updated: ${new Date().toLocaleString()}`);
   return events;
 }
 
 async function refreshCalendar() {
   try {
-    const events = await fetchRecurringEventsFromCsv();
+    const events = await fetchRecurringEvents();
     calendar.removeAllEvents();
     calendar.addEventSource(events);
   } catch (e) {
@@ -198,21 +238,19 @@ document.addEventListener("DOMContentLoaded", async () => {
     slotMinTime: SLOT_MIN_TIME,
     slotMaxTime: SLOT_MAX_TIME,
 
-    // One-page weekly schedule; no navigation; no date numbers
+    // One-page weekly view; no dates/navigation chrome
     headerToolbar: { left: "", center: "", right: "" },
-    dayHeaderFormat: { weekday: "long" },     // "Sunday", "Monday", …
-    titleFormat: { year: undefined, month: undefined, day: undefined },
+    dayHeaderFormat: { weekday: "long" },
 
-    // Hide the small “date” numbers that FullCalendar normally shows in week headers
-    // (This works by removing the “day number” element after render.)
-    viewDidMount: () => {
-      document.querySelectorAll(".fc-col-header-cell-cushion").forEach(el => {
-        el.style.whiteSpace = "nowrap";
-      });
-      document.querySelectorAll(".fc-daygrid-day-number, .fc-timegrid-axis-cushion").forEach(el => {});
-    },
+    nowIndicator: false,
 
-    nowIndicator: false
+    eventDidMount: (info) => {
+      const loc = info.event.extendedProps?.location;
+      const ts = info.event.extendedProps?.timeslot;
+      const p = info.event.extendedProps?.purpose;
+      const tooltip = [p, ts, loc].filter(Boolean).join(" — ");
+      if (tooltip) info.el.title = tooltip;
+    }
   });
 
   calendar.render();
