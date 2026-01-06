@@ -1,0 +1,149 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- FullCalendar (CDN) -->
+  <link href="https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/index.global.min.css" rel="stylesheet">
+  <link href="https://cdn.jsdelivr.net/npm/@fullcalendar/timegrid@6.1.15/index.global.min.css" rel="stylesheet">
+
+  <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/core@6.1.15/index.global.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@fullcalendar/timegrid@6.1.15/index.global.min.js"></script>
+
+  <style>
+    body { margin: 0; padding: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    #calendar { padding: 12px; }
+  </style>
+</head>
+
+<body>
+  <div id="calendar"></div>
+
+  <script>
+    // ==== CONFIG ====
+    const SHEET_ID = "1LkjDR3JC-L5n8zoEQEzJJOoGLvgzfTahEwQcZCbGghc";
+    const SHEET_NAME = "Sheet1"; // or "Availability"
+    // gviz endpoint (requires the sheet/tab to be accessible)
+    const GVIZ_URL =
+      `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json&sheet=${encodeURIComponent(SHEET_NAME)}`;
+
+    // Map your day codes to FullCalendar's Sunday-start week indexing
+    const DAY_INDEX = { Su: 0, Mo: 1, Tu: 2, We: 3, Th: 4, Fr: 5, Sa: 6 };
+
+    function startOfWeek(d) {
+      // Sunday as start of week
+      const date = new Date(d);
+      date.setHours(0,0,0,0);
+      const diff = date.getDay(); // 0=Sun
+      date.setDate(date.getDate() - diff);
+      return date;
+    }
+
+    function parseTime24(t) {
+      // Expect "HH:MM" in 24h format, e.g. "15:30"
+      const [hh, mm] = t.split(":").map(Number);
+      return { hh, mm };
+    }
+
+    async function fetchSheetRows() {
+      const res = await fetch(GVIZ_URL);
+      const text = await res.text();
+
+      // gviz returns JSON wrapped in a function call; extract the JSON payload
+      const jsonText = text.substring(text.indexOf("{"), text.lastIndexOf("}") + 1);
+      const data = JSON.parse(jsonText);
+
+      const cols = data.table.cols.map(c => (c.label || "").trim());
+      const rows = data.table.rows.map(r => r.c.map(cell => (cell ? cell.v : "")));
+
+      // Turn each row into an object keyed by column header
+      return rows
+        .filter(r => r.some(v => String(v).trim() !== ""))
+        .map(r => Object.fromEntries(cols.map((k, i) => [k, r[i]])));
+    }
+
+    function buildEvents(sheetRows) {
+      const now = new Date();
+      const weekStart = startOfWeek(now);
+
+      return sheetRows.map(row => {
+        // Adjust these field names to match your tab headers:
+        const title = row["Event Type"] || row["Title"] || "Available";
+        const dayCode = row["Day"];
+        const timeStr = row["Time"];
+        const location = row["Location"] || "";
+
+        // If you switch to Start/End columns, use those instead:
+        // const { hh: sh, mm: sm } = parseTime24(row["Start"]);
+        // const { hh: eh, mm: em } = parseTime24(row["End"]);
+
+        // If you keep a single "Time" like "1:20PM - 2:25PM", you'll want a robust parser.
+        // Strongly recommend Start/End columns to avoid parsing headaches.
+        const [startPart, endPart] = String(timeStr).split("-").map(s => s.trim());
+        if (!DAY_INDEX.hasOwnProperty(dayCode) || !startPart || !endPart) return null;
+
+        function parseAmPm(s) {
+          // Basic "1:20PM" style parsing
+          const m = s.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+          if (!m) return null;
+          let hh = Number(m[1]), mm = Number(m[2]);
+          const ap = m[3].toUpperCase();
+          if (ap === "PM" && hh !== 12) hh += 12;
+          if (ap === "AM" && hh === 12) hh = 0;
+          return { hh, mm };
+        }
+
+        const sTime = parseAmPm(startPart.replace(/\s+/g, ""));
+        const eTime = parseAmPm(endPart.replace(/\s+/g, ""));
+        if (!sTime || !eTime) return null;
+
+        const dayOffset = DAY_INDEX[dayCode];
+        const start = new Date(weekStart);
+        start.setDate(start.getDate() + dayOffset);
+        start.setHours(sTime.hh, sTime.mm, 0, 0);
+
+        const end = new Date(weekStart);
+        end.setDate(end.getDate() + dayOffset);
+        end.setHours(eTime.hh, eTime.mm, 0, 0);
+
+        return {
+          title,
+          start: start.toISOString(),
+          end: end.toISOString(),
+          extendedProps: { location },
+        };
+      }).filter(Boolean);
+    }
+
+    async function init() {
+      const rows = await fetchSheetRows();
+      const events = buildEvents(rows);
+
+      const calendarEl = document.getElementById("calendar");
+      const calendar = new FullCalendar.Calendar(calendarEl, {
+        initialView: "timeGridWeek",
+        firstDay: 0,              // Sunday
+        allDaySlot: false,
+        nowIndicator: true,
+        height: "auto",
+        slotMinTime: "07:00:00",
+        slotMaxTime: "22:00:00",
+        events,
+        eventDidMount: function(info) {
+          const loc = info.event.extendedProps.location;
+          if (loc) info.el.title = loc;
+        }
+      });
+
+      calendar.render();
+    }
+
+    init().catch(err => {
+      document.getElementById("calendar").innerHTML =
+        `<p style="padding:12px;">Error loading calendar data. Please check sheet access and column headers.</p>`;
+      console.error(err);
+    });
+  </script>
+</body>
+</html>
