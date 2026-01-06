@@ -3,13 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>CSV Block Calendar</title>
+  <title>Weekly Block Schedule</title>
 
-  <!-- FullCalendar (no build step) -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.css">
   <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
-
-  <!-- PapaParse for CSV parsing -->
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 
   <style>
@@ -19,7 +16,6 @@
     #calendar { max-width: 1200px; margin: 0 auto; }
   </style>
 </head>
-
 <body>
   <div id="wrap">
     <div id="status">Loading…</div>
@@ -28,47 +24,21 @@
 
 <script>
 /** =========================
- *  CONFIG
- *  ========================= */
-
-/** Your published CSV URL */
+ * CONFIG
+ * ========================= */
 const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vQMfXXgtx0YwUqkmvNPdQgzyiilhkiLMW9KZ2NrWsMx_tuj9GqfGLHHHQNuIFKaSCuQ1MxKwpYyAPlQ/pub?gid=0&single=true&output=csv";
 
-/**
- * COLUMN MAPPING
- * Update these to match your CSV header row exactly.
- *
- * Common patterns:
- *  - date + start + end (best)
- *  - start_datetime + end_datetime
- */
-const COL = {
-  title: "title",            // e.g., "Title", "Event", "Assignment"
-  date: "date",              // e.g., "Date" (YYYY-MM-DD)
-  start: "start",            // e.g., "Start" (HH:MM or HH:MM AM/PM)
-  end: "end",                // e.g., "End"
-  startDatetime: "start_datetime", // optional alternative
-  endDatetime: "end_datetime",     // optional alternative
-  location: "location",      // optional
-  category: "category",      // optional (used for coloring if present)
-  color: "color"             // optional (hex like #3b82f6)
-};
-
-/** Display defaults */
-const DEFAULT_VIEW = "timeGridWeek";     // timeGridWeek gives “block schedule” feel
-const WEEK_START = 1;                    // 0=Sunday, 1=Monday
+/** Calendar look/feel */
 const SLOT_MIN_TIME = "07:00:00";
 const SLOT_MAX_TIME = "20:00:00";
-
-/** Auto-refresh behavior */
-const REFRESH_EVERY_MINUTES = 15;        // periodic refresh
-const DAILY_REFRESH_HOUR = 8;            // refresh at 8:00am local time
+const WEEK_START = 0; // 0 = Sunday
+const REFRESH_EVERY_MINUTES = 15;
+const DAILY_REFRESH_HOUR = 8;
 const DAILY_REFRESH_MINUTE = 0;
 
 /** =========================
- *  IMPLEMENTATION
- *  ========================= */
-
+ * Helpers
+ * ========================= */
 let calendar;
 
 function setStatus(msg) {
@@ -81,94 +51,121 @@ function cacheBustedUrl(url) {
   return u.toString();
 }
 
-function normalizeTime(t) {
-  // Accepts "9:00", "09:00", "9:00 AM", etc. Leaves parsing to Date where possible.
-  return (t || "").trim();
+function norm(s) {
+  return (s ?? "").toString().trim();
 }
 
-function toISODate(d) {
-  return (d || "").trim(); // expect YYYY-MM-DD
+function findHeader(headers, candidates) {
+  // candidates: array of substrings to match, e.g. ["day", "weekday"]
+  const lower = headers.map(h => h.toLowerCase());
+  for (const cand of candidates) {
+    const idx = lower.findIndex(h => h === cand || h.includes(cand));
+    if (idx >= 0) return headers[idx];
+  }
+  return null;
 }
 
-function buildDateTime(dateStr, timeStr) {
-  // Produces "YYYY-MM-DDTHH:MM" (FullCalendar can parse this)
-  const d = toISODate(dateStr);
-  const t = normalizeTime(timeStr);
-  if (!d || !t) return null;
+function dayToDow(dayStr) {
+  const d = norm(dayStr).toLowerCase();
+  // Accept "Sun", "Sunday", etc.
+  const map = {
+    sun: 0, sunday: 0,
+    mon: 1, monday: 1,
+    tue: 2, tues: 2, tuesday: 2,
+    wed: 3, weds: 3, wednesday: 3,
+    thu: 4, thur: 4, thurs: 4, thursday: 4,
+    fri: 5, friday: 5,
+    sat: 6, saturday: 6
+  };
+  return map[d] ?? null;
+}
 
-  // If user uses AM/PM, let the Date parser interpret by building a local Date.
-  if (/[ap]m/i.test(t)) {
-    const dt = new Date(`${d} ${t}`);
+function toTimeHHMM(t) {
+  // FullCalendar recurring events accept startTime/endTime as "HH:MM" or "HH:MM:SS"
+  // We’ll try to preserve 24h times, and also parse basic AM/PM.
+  const s = norm(t);
+  if (!s) return null;
+
+  // If already looks like 24h "HH:MM" or "H:MM"
+  if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(s)) {
+    const [hh, mm, ss] = s.split(":");
+    const H = String(hh).padStart(2, "0");
+    const rest = ss ? `:${ss}` : "";
+    return `${H}:${mm}${rest}`;
+  }
+
+  // If AM/PM, convert using Date parsing with a fixed date.
+  if (/[ap]m/i.test(s)) {
+    const dt = new Date(`2000-01-01 ${s}`);
     if (isNaN(dt.getTime())) return null;
-    return dt.toISOString(); // FullCalendar accepts ISO; will render in local tz by default
+    const hh = String(dt.getHours()).padStart(2, "0");
+    const mm = String(dt.getMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
   }
-  // 24-hour time:
-  return `${d}T${t}`;
+
+  return null;
 }
 
-function rowToEvent(row) {
-  const title = (row[COL.title] || "").toString().trim() || "Untitled";
+function rowToRecurringEvent(row, keys) {
+  const dow = dayToDow(row[keys.day]);
+  const startTime = toTimeHHMM(row[keys.start]);
+  const endTime = toTimeHHMM(row[keys.end]);
+  const title = norm(row[keys.title]) || "Scheduled Block";
 
-  // Two supported schemas:
-  // A) date + start + end
-  // B) start_datetime + end_datetime
-  let start = null;
-  let end = null;
-
-  if (row[COL.startDatetime] && row[COL.endDatetime]) {
-    start = new Date(row[COL.startDatetime]);
-    end = new Date(row[COL.endDatetime]);
-    if (isNaN(start.getTime()) || isNaN(end.getTime())) return null;
-    start = start.toISOString();
-    end = end.toISOString();
-  } else {
-    start = buildDateTime(row[COL.date], row[COL.start]);
-    end = buildDateTime(row[COL.date], row[COL.end]);
-    if (!start || !end) return null;
-  }
-
-  const location = (row[COL.location] || "").toString().trim();
-  const category = (row[COL.category] || "").toString().trim();
-  const color = (row[COL.color] || "").toString().trim();
+  if (dow === null || !startTime || !endTime) return null;
 
   const evt = {
     title,
-    start,
-    end
+    daysOfWeek: [dow],     // recurring weekly
+    startTime,
+    endTime
   };
 
-  // Optional display enhancements
-  if (location) evt.extendedProps = { location, category };
-  if (color) evt.backgroundColor = color, evt.borderColor = color;
+  // Optional coloring if you have a color/category column
+  if (keys.color && norm(row[keys.color])) {
+    evt.backgroundColor = norm(row[keys.color]);
+    evt.borderColor = norm(row[keys.color]);
+  }
 
-  // If no explicit color but category exists, you can add a simple deterministic hash color:
-  // (left out to avoid “mystery colors”; add if you want.)
   return evt;
 }
 
-async function fetchEventsFromCsv() {
+async function fetchRecurringEventsFromCsv() {
   setStatus("Fetching CSV…");
-
   const resp = await fetch(cacheBustedUrl(CSV_URL), { cache: "no-store" });
   if (!resp.ok) throw new Error(`CSV fetch failed: ${resp.status} ${resp.statusText}`);
   const csvText = await resp.text();
 
   const parsed = Papa.parse(csvText, { header: true, skipEmptyLines: true });
-  if (parsed.errors?.length) {
-    // non-fatal parse errors may exist; still try
-    console.warn(parsed.errors);
-  }
-
   const rows = parsed.data || [];
-  const events = rows.map(rowToEvent).filter(Boolean);
+  const headers = parsed.meta?.fields || Object.keys(rows[0] || {});
+  if (!headers.length) throw new Error("CSV appears empty or has no header row.");
 
-  setStatus(`Loaded ${events.length} events. Last updated: ${new Date().toLocaleString()}`);
+  // Flexible header detection
+  const keys = {
+    day: findHeader(headers, ["day", "weekday"]),
+    start: findHeader(headers, ["start", "begin"]),
+    end: findHeader(headers, ["end", "finish"]),
+    title: findHeader(headers, ["title", "event", "name", "block"]),
+    color: findHeader(headers, ["color", "colour"])
+  };
+
+  if (!keys.day || !keys.start || !keys.end) {
+    console.warn("Detected headers:", headers);
+    console.warn("Detected key mapping:", keys);
+    throw new Error("Could not detect required columns (day/start/end). See console for detected headers.");
+  }
+  if (!keys.title) keys.title = keys.day; // fallback so something renders
+
+  const events = rows.map(r => rowToRecurringEvent(r, keys)).filter(Boolean);
+
+  setStatus(`Loaded ${events.length} blocks. Last updated: ${new Date().toLocaleString()}`);
   return events;
 }
 
 async function refreshCalendar() {
   try {
-    const events = await fetchEventsFromCsv();
+    const events = await fetchRecurringEventsFromCsv();
     calendar.removeAllEvents();
     calendar.addEventSource(events);
   } catch (e) {
@@ -178,7 +175,7 @@ async function refreshCalendar() {
 }
 
 function scheduleDailyRefreshAt(hour, minute) {
-  function msUntilNextTrigger() {
+  function msUntilNext() {
     const now = new Date();
     const next = new Date(now);
     next.setHours(hour, minute, 0, 0);
@@ -187,43 +184,43 @@ function scheduleDailyRefreshAt(hour, minute) {
   }
   setTimeout(async function run() {
     await refreshCalendar();
-    setTimeout(run, 24 * 60 * 60 * 1000); // repeat daily
-  }, msUntilNextTrigger());
+    setTimeout(run, 24 * 60 * 60 * 1000);
+  }, msUntilNext());
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
-  const el = document.getElementById("calendar");
-  calendar = new FullCalendar.Calendar(el, {
-    initialView: DEFAULT_VIEW,
+  calendar = new FullCalendar.Calendar(document.getElementById("calendar"), {
+    initialView: "timeGridWeek",
     firstDay: WEEK_START,
-    nowIndicator: true,
     height: "auto",
+    expandRows: true,
+    allDaySlot: false,
     slotMinTime: SLOT_MIN_TIME,
     slotMaxTime: SLOT_MAX_TIME,
-    allDaySlot: false,
-    expandRows: true,
-    eventTimeFormat: { hour: "numeric", minute: "2-digit" },
-    headerToolbar: {
-      left: "prev,next today",
-      center: "title",
-      right: "timeGridDay,timeGridWeek,dayGridMonth"
+
+    // One-page weekly schedule; no navigation; no date numbers
+    headerToolbar: { left: "", center: "", right: "" },
+    dayHeaderFormat: { weekday: "long" },     // "Sunday", "Monday", …
+    titleFormat: { year: undefined, month: undefined, day: undefined },
+
+    // Hide the small “date” numbers that FullCalendar normally shows in week headers
+    // (This works by removing the “day number” element after render.)
+    viewDidMount: () => {
+      document.querySelectorAll(".fc-col-header-cell-cushion").forEach(el => {
+        el.style.whiteSpace = "nowrap";
+      });
+      document.querySelectorAll(".fc-daygrid-day-number, .fc-timegrid-axis-cushion").forEach(el => {});
     },
-    eventDidMount: function(info) {
-      // Show location in tooltip if present
-      const loc = info.event.extendedProps?.location;
-      if (loc) info.el.title = loc;
-    }
+
+    nowIndicator: false
   });
 
   calendar.render();
   await refreshCalendar();
 
-  // Periodic refresh
   if (REFRESH_EVERY_MINUTES > 0) {
     setInterval(refreshCalendar, REFRESH_EVERY_MINUTES * 60 * 1000);
   }
-
-  // Daily refresh at 8:00am local time
   scheduleDailyRefreshAt(DAILY_REFRESH_HOUR, DAILY_REFRESH_MINUTE);
 });
 </script>
